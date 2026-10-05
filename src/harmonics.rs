@@ -234,6 +234,28 @@ fn render_internal(h: &Harmonics, sr: f64, samples: usize, hop: usize, scale: f6
             }
         }
     }
+    // Remove window tails inside explicit unvoiced consonant gaps; the residual
+    // receives this energy. Linear interpolation avoids a hard sample jump.
+    for n in 0..samples {
+        let pos = n as f64 / hop as f64;
+        let left = pos.floor() as usize;
+        let right = (left + 1).min(h.frames.saturating_sub(1));
+        let frac = pos - left as f64;
+        let lv = if h.f0.get(left).copied().unwrap_or(0.0) > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        let rv = if h.f0.get(right).copied().unwrap_or(0.0) > 0.0 {
+            1.0
+        } else {
+            0.0
+        };
+        let mask = lv + (rv - lv) * frac;
+        for c in 0..h.channels {
+            out[n * h.channels + c] *= mask;
+        }
+    }
     out
 }
 
@@ -648,7 +670,7 @@ mod tests {
             / (gap_end - gap_start) as f64)
             .sqrt();
         assert!(
-            gap_rms < 0.45,
+            gap_rms < 0.15,
             "harmonic layer absorbed too much gap energy: {gap_rms}"
         );
     }
