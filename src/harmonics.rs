@@ -283,7 +283,12 @@ fn render_internal(h: &Harmonics, sr: f64, samples: usize, hop: usize, scale: f6
         } else {
             0.0
         };
-        let mask = lv + (rv - lv) * frac;
+        let confidence = h.confidence.get(left).copied().unwrap_or(0.0)
+            + (h.confidence.get(right).copied().unwrap_or(0.0)
+                - h.confidence.get(left).copied().unwrap_or(0.0))
+                * frac;
+        let periodicity = ((confidence - 0.55) / 0.35).clamp(0.0, 1.0);
+        let mask = (lv + (rv - lv) * frac) * periodicity;
         for c in 0..h.channels {
             out[n * h.channels + c] *= mask;
         }
@@ -706,6 +711,26 @@ mod tests {
         assert!(
             gap_rms < 0.15,
             "harmonic layer absorbed too much gap energy: {gap_rms}"
+        );
+    }
+
+    #[test]
+    fn low_confidence_frame_suppresses_periodic_energy() {
+        let mut h = Harmonics::new(1, 3, 1);
+        h.f0 = vec![200.0, 200.0, 200.0];
+        h.confidence = vec![1.0, 0.0, 1.0];
+        h.count = vec![1, 1, 1];
+        h.window_length = vec![81, 81, 81];
+        for frame in 0..3 {
+            h.frequency[frame] = 200.0;
+            let ix = h.index(0, frame, 0);
+            h.amplitude[ix] = 1.0;
+        }
+        let rendered = render(&h, 8000, 200, 40, 1.0).unwrap();
+        let middle = rendered[40..44].iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!(
+            middle < 0.05,
+            "low-confidence frame retained periodic energy: {middle}"
         );
     }
 
