@@ -601,4 +601,55 @@ mod tests {
         assert_eq!(y.len(), n);
         assert!(y.iter().all(|x| x.is_finite()));
     }
+
+    #[test]
+    fn internal_unvoiced_gap_does_not_keep_full_harmonic_windows() {
+        let sr = 8000_u32;
+        let samples = 8000_usize;
+        let hop = 40_usize;
+        let frames = samples.div_ceil(hop) + 1;
+        let mut data = vec![0.0; samples];
+        let mut f0 = vec![200.0; frames];
+        for i in 0..samples {
+            let t = i as f64 / sr as f64;
+            data[i] = (2.0 * PI * 200.0 * t).sin();
+        }
+        let gap_start = 3200;
+        let gap_end = 3600;
+        for i in gap_start..gap_end {
+            f0[i / hop] = 0.0;
+            data[i] += 0.25 * (i as f64 * 0.73).sin();
+        }
+        let confidence = f0
+            .iter()
+            .map(|x| if *x > 0.0 { 1.0 } else { 0.0 })
+            .collect::<Vec<_>>();
+        let audio = Audio {
+            sample_rate: sr,
+            channels: 1,
+            data,
+            encoding: "FLOAT64".into(),
+        };
+        let mut cfg = Config::default();
+        cfg.maxnhar = 12;
+        cfg.vocal_f0_min = 100.;
+        cfg.vocal_f0_max = 400.;
+        let (harmonics, rendered) = fit(&audio, &f0, &confidence, hop, &cfg).unwrap();
+        let interior = harmonics.window_length[(gap_start / hop) - 2];
+        let edge = harmonics.window_length[(gap_start / hop) - 1];
+        assert!(
+            edge < interior,
+            "internal gap did not shorten harmonic support"
+        );
+        let gap_rms = (rendered[gap_start..gap_end]
+            .iter()
+            .map(|x| x * x)
+            .sum::<f64>()
+            / (gap_end - gap_start) as f64)
+            .sqrt();
+        assert!(
+            gap_rms < 0.45,
+            "harmonic layer absorbed too much gap energy: {gap_rms}"
+        );
+    }
 }
