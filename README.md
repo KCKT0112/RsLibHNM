@@ -54,3 +54,7 @@ The Rust port is structurally complete for compact parameter analysis, H/N expor
 
 The Rust unit suite currently contains 14 tests. The full optimized example has replay RMS error `1.13e-19`; H+N versus the reconstructed component differs by `1.49e-8` after float32 WAV output. A targeted internal-consonant-gap and breathy residual suite passes, but broad recorded-vocal SDR validation remains incomplete.
 The harmonic renderer now linearly masks explicit unvoiced frame gaps after overlap-add, preventing voiced-window tails from filling internal consonant intervals. A dedicated regression reduced the internal-gap harmonic RMS to below 0.15 on the fixed synthetic case. This does not solve every consonant or breathy-vocal condition; broad real-vocal SDR validation remains required.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
