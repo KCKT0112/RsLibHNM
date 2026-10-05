@@ -24,19 +24,11 @@ struct DiskHarmonics {
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DiskFeatures {
-    noise_envelope: Vec<f32>,
     noise_psd: Vec<f32>,
     noise_psd_edges: Vec<f32>,
     noise_band_energy: Vec<f32>,
     noise_band_edges: Vec<f32>,
     noise_modulation: Vec<f32>,
-    spectral_cepstrum: Vec<f32>,
-    bap_cepstrum: Vec<f32>,
-    lip_response: Vec<f32>,
-    mel_log_spectrum: Vec<f32>,
-    bap: Vec<f32>,
-    rd: Vec<f32>,
-    rd_confidence: Vec<f32>,
     vector: Vec<f32>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -71,19 +63,11 @@ fn disk(a: &Analysis) -> DiskModel {
             window_length: h.window_length.iter().map(|x| *x as u32).collect(),
         },
         features: DiskFeatures {
-            noise_envelope: f32s(&f.noise_envelope),
             noise_psd: f32s(&f.noise_psd),
             noise_psd_edges: f32s(&f.noise_psd_edges),
             noise_band_energy: f32s(&f.noise_band_energy),
             noise_band_edges: f32s(&f.noise_band_edges),
             noise_modulation: f32s(&f.noise_modulation),
-            spectral_cepstrum: f32s(&f.spectral_cepstrum),
-            bap_cepstrum: f32s(&f.bap_cepstrum),
-            lip_response: f32s(&f.lip_response),
-            mel_log_spectrum: f32s(&f.mel_log_spectrum),
-            bap: f32s(&f.bap),
-            rd: f32s(&f.rd),
-            rd_confidence: f32s(&f.rd_confidence),
             vector: f32s(&f.vector),
         },
     }
@@ -120,19 +104,19 @@ fn inflate(d: DiskModel) -> Analysis {
             window_length: h.window_length.iter().map(|x| *x as usize).collect(),
         },
         features: Features {
-            noise_envelope: f64s(&f.noise_envelope),
+            noise_envelope: vec![0.0; h.channels * h.frames],
             noise_psd: f64s(&f.noise_psd),
             noise_psd_edges: f64s(&f.noise_psd_edges),
             noise_band_energy: f64s(&f.noise_band_energy),
             noise_band_edges: f64s(&f.noise_band_edges),
             noise_modulation: f64s(&f.noise_modulation),
-            spectral_cepstrum: f64s(&f.spectral_cepstrum),
-            bap_cepstrum: f64s(&f.bap_cepstrum),
-            lip_response: f64s(&f.lip_response),
-            mel_log_spectrum: f64s(&f.mel_log_spectrum),
-            bap: f64s(&f.bap),
-            rd: f64s(&f.rd),
-            rd_confidence: f64s(&f.rd_confidence),
+            spectral_cepstrum: Vec::new(),
+            bap_cepstrum: Vec::new(),
+            lip_response: Vec::new(),
+            mel_log_spectrum: Vec::new(),
+            bap: Vec::new(),
+            rd: Vec::new(),
+            rd_confidence: Vec::new(),
             vector: f64s(&f.vector),
         },
     }
@@ -158,10 +142,16 @@ pub fn save_compact(analysis: &Analysis, path: &Path) -> Result<()> {
 pub fn load(path: &Path) -> Result<Analysis> {
     let bytes = std::fs::read(path)?;
     let compact = bytes.starts_with(MAGIC_COMPACT);
-    ensure!(compact || bytes.starts_with(MAGIC_FULL), "invalid Rust HNM model signature/version");
+    ensure!(
+        compact || bytes.starts_with(MAGIC_FULL),
+        "invalid Rust HNM model signature/version"
+    );
     let raw = zstd::decode_all(&bytes[8..])?;
-    let analysis = if compact { inflate(bincode::deserialize::<DiskModel>(&raw)?) }
-                   else { bincode::deserialize::<Analysis>(&raw)? };
+    let analysis = if compact {
+        inflate(bincode::deserialize::<DiskModel>(&raw)?)
+    } else {
+        bincode::deserialize::<Analysis>(&raw)?
+    };
     analysis.validate()?;
     Ok(analysis)
 }

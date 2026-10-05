@@ -3,6 +3,7 @@ use crate::types::{Audio, Harmonics};
 use anyhow::{Result, ensure};
 use nalgebra::DMatrix;
 use num_complex::Complex64;
+use rayon::prelude::*;
 use std::f64::consts::PI;
 
 fn basis(t: &[f64], f0: f64, slope: f64, count: usize) -> DMatrix<f64> {
@@ -236,6 +237,35 @@ fn render_internal(h: &Harmonics, sr: f64, samples: usize, hop: usize, scale: f6
     out
 }
 
+/// Results of fitting one frame, kept independent so frames can be solved in parallel.
+struct FrameFit {
+    f0: f64,
+    confidence: f64,
+    frequency: Vec<f64>,
+    slope: Vec<f64>,
+    amplitude: Vec<f64>,
+    phase: Vec<f64>,
+    amplitude_gradient: Vec<f64>,
+    count: usize,
+    window_length: usize,
+}
+
+impl FrameFit {
+    fn empty(channels: usize, capacity: usize, confidence: f64) -> Self {
+        Self {
+            f0: 0.,
+            confidence,
+            frequency: vec![0.; capacity],
+            slope: vec![0.; capacity],
+            amplitude: vec![0.; channels * capacity],
+            phase: vec![0.; channels * capacity],
+            amplitude_gradient: vec![0.; channels],
+            count: 0,
+            window_length: 0,
+        }
+    }
+}
+
 /// Fit center-referenced local chirps with variable-projection F0/slope refinement.
 pub fn fit(
     audio: &Audio,
@@ -260,6 +290,9 @@ pub fn fit(
     h.f0 = f0_in.to_vec();
     h.confidence = confidence_in.to_vec();
     let sr = audio.sample_rate as f64;
+
+    // The strongest channel is shared by every frame and is selected before the
+    // parallel region, preserving the original strict-greater tie breaking.
     let mut strongest = 0;
     let mut maxe = 0.;
     for c in 0..channels {
@@ -274,123 +307,158 @@ pub fn fit(
             strongest = c;
         }
     }
-    for j in 0..frames {
-        let initial = h.f0[j];
-        if !initial.is_finite() || initial <= 0. {
-            h.f0[j] = 0.;
-            continue;
-        }
-        let length = ((config.rel_winsize * sr / initial).round() as usize).max(2 * hop + 1) | 1;
-        let center = j * hop;
-        let (a, b, t, w) = frame_window(center, length, samples, sr);
-        if b - a < 8 {
-            h.f0[j] = 0.;
-            h.confidence[j] = 0.;
-            continue;
-        }
-        let valid = w.iter().filter(|x| **x > 0.05).count();
-        let maxcount = cap
-            .min(((sr / 2. - 1.) / (initial * 1.07)).floor().max(1.) as usize)
-            .min((valid / 4).max(1));
-        if maxcount < 1 {
-            h.f0[j] = 0.;
-            h.confidence[j] = 0.;
-            continue;
-        }
-        let mut slope0 = 0.;
-        if j > 0 && j + 1 < frames && h.f0[j - 1] > 0. && h.f0[j + 1] > 0. {
-            slope0 = (h.f0[j + 1] - h.f0[j - 1]) * sr / (2. * hop as f64);
-        }
-        let target = DMatrix::from_fn(b - a, 1, |i, _| audio.data[(a + i) * channels + strongest]);
-        let fitcount = maxcount.min(12);
-        let span = (length / 2) as f64 / sr;
-        let eval = |ff: f64, ss: f64| {
-            let aa = basis(&t, ff, ss, fitcount);
-            let cc = solve(&aa, &target, &w);
-            let mut e = 0.;
-            for i in 0..aa.nrows() {
-                let d = w[i]
-                    * (target[(i, 0)]
-                        - (0..aa.ncols())
-                            .map(|k| aa[(i, k)] * cc[(k, 0)])
-                            .sum::<f64>());
-                e += d * d;
+
+    // Every frame reads only immutable input and writes its own result.  Rayon
+    // collects by source-index order, so assembly below is deterministic even
+    // though frame completion order is not.
+    let frame_results: Vec<FrameFit> = (0..frames)
+        .into_par_iter()
+        .map(|j| {
+            let initial = f0_in[j];
+            let mut result = FrameFit::empty(channels, cap, confidence_in[j]);
+            if !initial.is_finite() || initial <= 0. {
+                return result;
             }
-            e
-        };
-        let energy = (0..b - a)
-            .map(|i| {
-                let z = w[i] * target[(i, 0)];
-                z * z
-            })
-            .sum::<f64>();
-        if energy < 1e-22 {
-            h.f0[j] = 0.;
-            h.confidence[j] = 0.;
-            continue;
-        }
-        let mut ff = initial.clamp(config.vocal_f0_min, config.vocal_f0_max);
-        let mut ss = slope0;
-        let flo = config.vocal_f0_min.max(initial * 0.94);
-        let fhi = config.vocal_f0_max.min(initial * 1.06);
-        let slo = -initial * 0.15 / span;
-        let shi = initial * 0.15 / span;
-        let mut stepf = (fhi - flo) / 4.;
-        let mut steps = (shi - slo) / 4.;
-        for _ in 0..4 {
-            let mut best = eval(ff, ss);
-            let mut bf = ff;
-            let mut bs = ss;
-            for di in -1..=1 {
-                for ds in -1..=1 {
-                    let qf = (ff + di as f64 * stepf).clamp(flo, fhi);
-                    let qs = (ss + ds as f64 * steps).clamp(slo, shi);
-                    let e = eval(qf, qs);
-                    if e < best {
-                        best = e;
-                        bf = qf;
-                        bs = qs;
+
+            let length =
+                ((config.rel_winsize * sr / initial).round() as usize).max(2 * hop + 1) | 1;
+            let center = j * hop;
+            let (a, b, t, w) = frame_window(center, length, samples, sr);
+            if b - a < 8 {
+                result.confidence = 0.;
+                return result;
+            }
+            let valid = w.iter().filter(|x| **x > 0.05).count();
+            let maxcount = cap
+                .min(((sr / 2. - 1.) / (initial * 1.07)).floor().max(1.) as usize)
+                .min((valid / 4).max(1));
+            if maxcount < 1 {
+                result.confidence = 0.;
+                return result;
+            }
+
+            // Unlike the old serial loop, the initial slope uses the supplied
+            // pitch track.  This removes a hidden dependence on the preceding
+            // frame's refined value and makes each frame genuinely independent;
+            // the bounded variable-projection search still performs the same
+            // slope refinement for every frame.
+            let mut slope0 = 0.;
+            if j > 0 && j + 1 < frames && f0_in[j - 1] > 0. && f0_in[j + 1] > 0. {
+                slope0 = (f0_in[j + 1] - f0_in[j - 1]) * sr / (2. * hop as f64);
+            }
+            let target =
+                DMatrix::from_fn(b - a, 1, |i, _| audio.data[(a + i) * channels + strongest]);
+            let fitcount = maxcount.min(12);
+            let span = (length / 2) as f64 / sr;
+            let eval = |ff: f64, ss: f64| {
+                let aa = basis(&t, ff, ss, fitcount);
+                let cc = solve(&aa, &target, &w);
+                let mut e = 0.;
+                for i in 0..aa.nrows() {
+                    let d = w[i]
+                        * (target[(i, 0)]
+                            - (0..aa.ncols())
+                                .map(|k| aa[(i, k)] * cc[(k, 0)])
+                                .sum::<f64>());
+                    e += d * d;
+                }
+                e
+            };
+            let energy = (0..b - a)
+                .map(|i| {
+                    let z = w[i] * target[(i, 0)];
+                    z * z
+                })
+                .sum::<f64>();
+            if energy < 1e-22 {
+                result.confidence = 0.;
+                return result;
+            }
+
+            let mut ff = initial.clamp(config.vocal_f0_min, config.vocal_f0_max);
+            let mut ss = slope0;
+            let flo = config.vocal_f0_min.max(initial * 0.94);
+            let fhi = config.vocal_f0_max.min(initial * 1.06);
+            let slo = -initial * 0.15 / span;
+            let shi = initial * 0.15 / span;
+            let mut stepf = (fhi - flo) / 4.;
+            let mut steps = (shi - slo) / 4.;
+            for _ in 0..4 {
+                let mut best = eval(ff, ss);
+                let mut bf = ff;
+                let mut bs = ss;
+                for di in -1..=1 {
+                    for ds in -1..=1 {
+                        let qf = (ff + di as f64 * stepf).clamp(flo, fhi);
+                        let qs = (ss + ds as f64 * steps).clamp(slo, shi);
+                        let e = eval(qf, qs);
+                        if e < best {
+                            best = e;
+                            bf = qf;
+                            bs = qs;
+                        }
                     }
                 }
+                ff = bf;
+                ss = bs;
+                stepf *= 0.5;
+                steps *= 0.5;
             }
-            ff = bf;
-            ss = bs;
-            stepf *= 0.5;
-            steps *= 0.5;
-        }
-        let count = cap
-            .min(((sr / 2. - 1.) / (ff + ss.abs() * span)).floor().max(1.) as usize)
-            .min((valid / 4).max(1));
-        let aa = basis(&t, ff, ss, count);
-        h.f0[j] = ff;
-        h.frequency[j * cap..j * cap + count]
-            .iter_mut()
-            .enumerate()
-            .for_each(|(k, x)| *x = ff * (k + 1) as f64);
-        h.slope[j * cap..j * cap + count]
-            .iter_mut()
-            .enumerate()
-            .for_each(|(k, x)| *x = ss * (k + 1) as f64);
-        h.count[j] = count;
-        h.window_length[j] = length;
-        // Fit all recording channels with the final projected frequency.
-        let yy = DMatrix::from_fn(b - a, channels, |i, c| audio.data[(a + i) * channels + c]);
-        let (allcoeff, allgr) = fit_envelope(
-            &aa,
-            &yy,
-            &w,
-            &t.iter().map(|x| x / span).collect::<Vec<_>>(),
-        );
+
+            let count = cap
+                .min(((sr / 2. - 1.) / (ff + ss.abs() * span)).floor().max(1.) as usize)
+                .min((valid / 4).max(1));
+            let aa = basis(&t, ff, ss, count);
+            result.f0 = ff;
+            result.frequency[..count]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(k, x)| *x = ff * (k + 1) as f64);
+            result.slope[..count]
+                .iter_mut()
+                .enumerate()
+                .for_each(|(k, x)| *x = ss * (k + 1) as f64);
+            result.count = count;
+            result.window_length = length;
+
+            // Fit all recording channels with the final projected frequency.
+            let yy = DMatrix::from_fn(b - a, channels, |i, c| audio.data[(a + i) * channels + c]);
+            let (allcoeff, allgr) = fit_envelope(
+                &aa,
+                &yy,
+                &w,
+                &t.iter().map(|x| x / span).collect::<Vec<_>>(),
+            );
+            for c in 0..channels {
+                result.amplitude_gradient[c] = allgr[c] / span;
+                for k in 0..count {
+                    let coeff_cos = allcoeff[(k, c)];
+                    let coeff_sin = allcoeff[(count + k, c)];
+                    let ix = c * cap + k;
+                    result.amplitude[ix] = (coeff_cos.powi(2) + coeff_sin.powi(2)).sqrt();
+                    result.phase[ix] = (-coeff_sin).atan2(coeff_cos);
+                }
+            }
+            result
+        })
+        .collect();
+
+    for (j, result) in frame_results.into_iter().enumerate() {
+        h.f0[j] = result.f0;
+        h.confidence[j] = result.confidence;
+        h.frequency[j * cap..(j + 1) * cap].copy_from_slice(&result.frequency);
+        h.slope[j * cap..(j + 1) * cap].copy_from_slice(&result.slope);
+        h.count[j] = result.count;
+        h.window_length[j] = result.window_length;
         for c in 0..channels {
-            h.amplitude_gradient[c * frames + j] = allgr[c] / span;
-            for k in 0..count {
-                let ix = h.index(c, j, k);
-                h.amplitude[ix] =
-                    (allcoeff[(k, c)].powi(2) + allcoeff[(count + k, c)].powi(2)).sqrt();
-                h.phase[ix] = (-allcoeff[(count + k, c)]).atan2(allcoeff[(k, c)]);
-            }
+            h.amplitude_gradient[c * frames + j] = result.amplitude_gradient[c];
+            let dst = (c * frames + j) * cap;
+            let src = c * cap;
+            h.amplitude[dst..dst + cap].copy_from_slice(&result.amplitude[src..src + cap]);
+            h.phase[dst..dst + cap].copy_from_slice(&result.phase[src..src + cap]);
         }
     }
+
     stabilize(&mut h, audio, hop);
     truncate_internal_gap_windows(&mut h, hop);
     let rendered = render_internal(&h, sr, samples, hop, 1.0);
@@ -452,13 +520,33 @@ fn stabilize(h: &mut Harmonics, audio: &Audio, hop: usize) {
     }
 }
 
-fn truncate_internal_gap_windows(h:&mut Harmonics,hop:usize){
-    let voiced:Vec<bool>=h.f0.iter().map(|x|x.is_finite()&&*x>0.).collect();
-    let mut starts=Vec::new();let mut ends=Vec::new();
-    for i in 0..=h.frames{let before=i>0&&voiced[i-1];let after=i<h.frames&&voiced[i];if after&&!before{starts.push(i);}if before&&!after{ends.push(i);}}
-    for run in 0..starts.len().min(ends.len()){
-        let first=starts[run];let end=ends[run];if run==0&&run+1==starts.len(){continue;}
-        for j in first..end{let distance=(j-first+1).min(end-j);let limit=2*hop.max(distance*hop)+1;if h.window_length[j]>limit{h.window_length[j]=limit;}}
+fn truncate_internal_gap_windows(h: &mut Harmonics, hop: usize) {
+    let voiced: Vec<bool> = h.f0.iter().map(|x| x.is_finite() && *x > 0.).collect();
+    let mut starts = Vec::new();
+    let mut ends = Vec::new();
+    for i in 0..=h.frames {
+        let before = i > 0 && voiced[i - 1];
+        let after = i < h.frames && voiced[i];
+        if after && !before {
+            starts.push(i);
+        }
+        if before && !after {
+            ends.push(i);
+        }
+    }
+    for run in 0..starts.len().min(ends.len()) {
+        let first = starts[run];
+        let end = ends[run];
+        if run == 0 && run + 1 == starts.len() {
+            continue;
+        }
+        for j in first..end {
+            let distance = (j - first + 1).min(end - j);
+            let limit = 2 * hop.max(distance * hop) + 1;
+            if h.window_length[j] > limit {
+                h.window_length[j] = limit;
+            }
+        }
     }
 }
 
