@@ -392,6 +392,7 @@ pub fn fit(
         }
     }
     stabilize(&mut h, audio, hop);
+    truncate_internal_gap_windows(&mut h, hop);
     let rendered = render_internal(&h, sr, samples, hop, 1.0);
     Ok((h, rendered))
 }
@@ -448,6 +449,16 @@ fn stabilize(h: &mut Harmonics, audio: &Audio, hop: usize) {
                 h.phase[ix] = cleaned.arg();
             }
         }
+    }
+}
+
+fn truncate_internal_gap_windows(h:&mut Harmonics,hop:usize){
+    let voiced:Vec<bool>=h.f0.iter().map(|x|x.is_finite()&&*x>0.).collect();
+    let mut starts=Vec::new();let mut ends=Vec::new();
+    for i in 0..=h.frames{let before=i>0&&voiced[i-1];let after=i<h.frames&&voiced[i];if after&&!before{starts.push(i);}if before&&!after{ends.push(i);}}
+    for run in 0..starts.len().min(ends.len()){
+        let first=starts[run];let end=ends[run];if run==0&&run+1==starts.len(){continue;}
+        for j in first..end{let distance=(j-first+1).min(end-j);let limit=2*hop.max(distance*hop)+1;if h.window_length[j]>limit{h.window_length[j]=limit;}}
     }
 }
 
