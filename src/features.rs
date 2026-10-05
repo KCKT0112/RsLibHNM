@@ -125,20 +125,51 @@ fn bands(
     }
     out
 }
-fn dct(v: &[f64], n: usize) -> Vec<f64> {
-    let m = v.len() as f64;
-    (0..n)
-        .map(|k| {
-            let s = (0..v.len())
-                .map(|i| v[i] * (PI * (i as f64 + 0.5) * k as f64 / m).cos())
-                .sum::<f64>();
-            s * (if k == 0 {
-                1. / m.sqrt()
-            } else {
-                (2. / m).sqrt()
+struct DctPlan {
+    input_len: usize,
+    output_len: usize,
+    cosine: Vec<f64>,
+    scale: Vec<f64>,
+}
+
+impl DctPlan {
+    fn new(input_len: usize, output_len: usize) -> Self {
+        let m = input_len as f64;
+        let mut cosine = vec![0.; input_len * output_len];
+        for k in 0..output_len {
+            for i in 0..input_len {
+                cosine[k * input_len + i] = (PI * (i as f64 + 0.5) * k as f64 / m).cos();
+            }
+        }
+        let scale = (0..output_len)
+            .map(|k| {
+                if k == 0 {
+                    1. / m.sqrt()
+                } else {
+                    (2. / m).sqrt()
+                }
             })
-        })
-        .collect()
+            .collect();
+        Self {
+            input_len,
+            output_len,
+            cosine,
+            scale,
+        }
+    }
+
+    fn apply_into(&self, input: &[f64], output: &mut [f64]) {
+        debug_assert_eq!(input.len(), self.input_len);
+        debug_assert_eq!(output.len(), self.output_len);
+        for k in 0..self.output_len {
+            let coeff = &self.cosine[k * self.input_len..(k + 1) * self.input_len];
+            let mut sum = 0.;
+            for i in 0..self.input_len {
+                sum += input[i] * coeff[i];
+            }
+            output[k] = sum * self.scale[k];
+        }
+    }
 }
 
 fn modulation(
@@ -151,21 +182,34 @@ fn modulation(
 ) -> Vec<f64> {
     let samples = residual.samples();
     let nfft = samples.next_power_of_two().max(2);
-    let mut result = vec![0.; residual.channels * f0.len() * (edges.len() - 1) * (1 + 2 * order)];
+    let bands = edges.len() - 1;
     let dim = 1 + 2 * order;
+    let mut result = vec![0.; residual.channels * f0.len() * bands * dim];
     let mut fft = Fft::new(nfft);
     let mut x = vec![0.; nfft];
     let mut base = vec![Complex64::new(0., 0.); nfft];
     let mut z = vec![Complex64::new(0., 0.); nfft];
     let mut filtered = vec![0.; nfft];
     let mut env = vec![0.; nfft];
+    let mut env_by_band = vec![0.; bands * nfft];
     let mut ata = vec![0.; dim * dim];
-    let mut aty = vec![0.; dim];
     let mut row = vec![0.; dim];
-    let mut solver = vec![0.; dim * (dim + 1)];
-    let mut solution = vec![0.; dim];
+    let mut elimination = vec![0.; dim * dim];
+    let mut aty_all = vec![0.; bands * dim];
+    let mut inverse = vec![0.; f0.len() * dim * dim];
+    let mut valid = vec![false; f0.len()];
     let frequencies: Vec<f64> = (0..nfft)
         .map(|k| k.min(nfft - k) as f64 * sr as f64 / nfft as f64)
+        .collect();
+    // The band test is independent of channel/frame. Keeping it out of the
+    // FFT loop avoids repeated frequency arithmetic for every modulation fit.
+    let masks: Vec<Vec<bool>> = (0..bands)
+        .map(|bnd| {
+            frequencies
+                .iter()
+                .map(|&fr| fr >= edges[bnd] && fr < edges[bnd + 1])
+                .collect()
+        })
         .collect();
     let windows: Vec<(usize, usize)> = f0
         .iter()
@@ -177,102 +221,138 @@ fn modulation(
             (a, b)
         })
         .collect();
+    // Normal equations depend only on f0/window, not on channel or band.
+    // Factor each once, then reuse it for every envelope fit below.
+    for (j, &f0j) in f0.iter().enumerate() {
+        let (a, bb) = windows[j];
+        let count = bb.saturating_sub(a);
+        if f0j <= 0. || count <= 2 * order + 1 {
+            continue;
+        }
+        ata.fill(0.);
+        for i in a..bb {
+            let t = (i as f64 - j as f64 * hop as f64) / sr as f64;
+            row[0] = 1.;
+            for k in 1..=order {
+                row[k] = (2. * PI * t * f0j * k as f64).cos();
+                row[order + k] = (2. * PI * t * f0j * k as f64).sin();
+            }
+            for q in 0..dim {
+                for r in 0..dim {
+                    ata[q * dim + r] += row[q] * row[r];
+                }
+            }
+        }
+        let dst = &mut inverse[j * dim * dim..(j + 1) * dim * dim];
+        if invert_into(&ata, dim, &mut elimination, dst) {
+            valid[j] = true;
+        }
+    }
     for c in 0..residual.channels {
         for i in 0..samples {
             x[i] = residual.data[i * residual.channels + c];
         }
         x[samples..].fill(0.);
         fft.forward_into(&x, &mut base);
-        for bnd in 0..edges.len() - 1 {
+        for bnd in 0..bands {
             z.copy_from_slice(&base);
-            for k in 0..nfft {
-                let fr = frequencies[k];
-                if fr < edges[bnd] || fr >= edges[bnd + 1] {
+            for (k, &keep) in masks[bnd].iter().enumerate() {
+                if !keep {
                     z[k] = Complex64::new(0., 0.);
                 }
             }
             fft.inverse_into(&z, &mut filtered);
-            fft.analytic_envelope_into(&filtered, &mut env);
-            for (j, &f0j) in f0.iter().enumerate() {
+            // `z` is already the spectrum of the filtered signal. Applying
+            // the Hilbert multiplier directly saves a redundant forward FFT.
+            fft.analytic_envelope_from_spectrum_into(&z, &mut env);
+            env_by_band[bnd * nfft..(bnd + 1) * nfft].copy_from_slice(&env);
+            for (j, _) in f0.iter().enumerate() {
                 let (a, bb) = windows[j];
                 if bb <= a {
                     continue;
                 }
                 let count = bb - a;
                 let mut rms = 0.;
-                for i in a..bb {
-                    rms += filtered[i] * filtered[i];
+                for &sample in &filtered[a..bb] {
+                    rms += sample * sample;
                 }
-                rms = (rms / count as f64).sqrt();
-                let idx = ((c * f0.len() + j) * (edges.len() - 1) + bnd) * dim;
-                result[idx] = rms;
-                if f0j <= 0. || count <= 2 * order + 1 {
-                    continue;
+                let idx = ((c * f0.len() + j) * bands + bnd) * dim;
+                result[idx] = (rms / count as f64).sqrt();
+            }
+        }
+        // Build all channel-band right hand sides while evaluating each
+        // design row once. This removes repeated trig calls across bands.
+        for (j, _) in f0.iter().enumerate() {
+            let (a, bb) = windows[j];
+            if bb <= a || !valid[j] {
+                continue;
+            }
+            aty_all.fill(0.);
+            let f0j = f0[j];
+            for i in a..bb {
+                let t = (i as f64 - j as f64 * hop as f64) / sr as f64;
+                row[0] = 1.;
+                for k in 1..=order {
+                    row[k] = (2. * PI * t * f0j * k as f64).cos();
+                    row[order + k] = (2. * PI * t * f0j * k as f64).sin();
                 }
-                ata.fill(0.);
-                aty.fill(0.);
-                for i in a..bb {
-                    let t = (i as f64 - j as f64 * hop as f64) / sr as f64;
-                    row.fill(1.);
-                    for k in 1..=order {
-                        row[k] = (2. * PI * t * f0j * k as f64).cos();
-                        row[order + k] = (2. * PI * t * f0j * k as f64).sin();
-                    }
+                for bnd in 0..bands {
+                    let y = env_by_band[bnd * nfft + i] / 2f64.sqrt();
                     for q in 0..dim {
-                        aty[q] += row[q] * env[i] / 2f64.sqrt();
-                        for r in 0..dim {
-                            ata[q * dim + r] += row[q] * row[r];
-                        }
+                        aty_all[bnd * dim + q] += row[q] * y;
                     }
                 }
-                if solve_into(&ata, &aty, dim, &mut solver, &mut solution) {
-                    for k in 1..=order {
-                        result[idx + k] = solution[k];
-                        result[idx + order + k] = solution[order + k];
+            }
+            let inv = &inverse[j * dim * dim..(j + 1) * dim * dim];
+            for bnd in 0..bands {
+                let idx = ((c * f0.len() + j) * bands + bnd) * dim;
+                for q in 1..dim {
+                    let mut value = 0.;
+                    for r in 0..dim {
+                        value += inv[q * dim + r] * aty_all[bnd * dim + r];
                     }
+                    result[idx + q] = value;
                 }
             }
         }
     }
     result
 }
-fn solve_into(a: &[f64], b: &[f64], n: usize, m: &mut [f64], out: &mut [f64]) -> bool {
+
+fn invert_into(a: &[f64], n: usize, work: &mut [f64], out: &mut [f64]) -> bool {
+    work.copy_from_slice(a);
+    out.fill(0.);
     for i in 0..n {
-        for j in 0..n {
-            m[i * (n + 1) + j] = a[i * n + j];
-        }
-        m[i * (n + 1) + n] = b[i];
+        out[i * n + i] = 1.;
     }
     for i in 0..n {
-        let Some(p) = (i..n).max_by(|x, y| {
-            m[*x * (n + 1) + i]
-                .abs()
-                .total_cmp(&m[*y * (n + 1) + i].abs())
-        }) else {
+        let Some(p) =
+            (i..n).max_by(|x, y| work[*x * n + i].abs().total_cmp(&work[*y * n + i].abs()))
+        else {
             return false;
         };
-        if m[p * (n + 1) + i].abs() < 1e-12 {
+        if work[p * n + i].abs() < 1e-12 {
             return false;
         }
-        for j in i..=n {
-            m.swap(i * (n + 1) + j, p * (n + 1) + j);
+        for j in 0..n {
+            work.swap(i * n + j, p * n + j);
+            out.swap(i * n + j, p * n + j);
         }
-        let d = m[i * (n + 1) + i];
-        for j in i..=n {
-            m[i * (n + 1) + j] /= d;
+        let d = work[i * n + i];
+        for j in 0..n {
+            work[i * n + j] /= d;
+            out[i * n + j] /= d;
         }
         for q in 0..n {
             if q == i {
                 continue;
             }
-            let d = m[q * (n + 1) + i];
-            for j in i..=n {
-                m[q * (n + 1) + j] -= d * m[i * (n + 1) + j];
+            let d = work[q * n + i];
+            for j in 0..n {
+                work[q * n + j] -= d * work[i * n + j];
+                out[q * n + j] -= d * out[i * n + j];
             }
         }
-    }
-    for i in 0..n {
-        out[i] = m[i * (n + 1) + n];
     }
     true
 }
@@ -376,8 +456,11 @@ pub fn extract(
             }
         }
     }
+    let bap_plan = DctPlan::new(config.npsd, config.order_bap + 1);
+    let spectral_plan = DctPlan::new(bins, config.order_spec + 1);
     let mut bapc = vec![0.; harmonic.channels * frames * (config.order_bap + 1)];
     let mut ratio = vec![1.; config.npsd];
+    let mut dct_out = vec![0.; config.order_bap + 1];
     for c in 0..harmonic.channels {
         for f in 0..frames {
             for k in 0..config.npsd {
@@ -388,14 +471,15 @@ pub fn extract(
                     1.
                 };
             }
-            let d = dct(&ratio, config.order_bap + 1);
-            for q in 0..d.len() {
-                bapc[(c * frames + f) * (config.order_bap + 1) + q] = d[q];
+            bap_plan.apply_into(&ratio, &mut dct_out);
+            for q in 0..dct_out.len() {
+                bapc[(c * frames + f) * (config.order_bap + 1) + q] = dct_out[q];
             }
         }
     }
     let mut spectral = vec![0.; harmonic.channels * frames * (config.order_spec + 1)];
     let mut loga = vec![0.; bins];
+    let mut cep = vec![0.; config.order_spec + 1];
     for c in 0..harmonic.channels {
         for f in 0..frames {
             for k in 0..bins {
@@ -404,7 +488,7 @@ pub fn extract(
                         .max(1e-20)
                         .ln();
             }
-            let cep = dct(&loga, config.order_spec + 1);
+            spectral_plan.apply_into(&loga, &mut cep);
             for q in 0..cep.len() {
                 spectral[(c * frames + f) * (config.order_spec + 1) + q] = cep[q];
             }
@@ -415,20 +499,26 @@ pub fn extract(
         .map(|i| 700. * ((i as f64 / 63. * (1. + nyq / 700.).ln()).exp() - 1.))
         .collect::<Vec<_>>();
     let mut smooth = vec![0.; bins];
+    let mut gaussian = vec![0.; bins];
     for c in 0..harmonic.channels {
         for f in 0..frames {
             let sigma = (h.f0[f] * config.n_fft as f64 / harmonic.sample_rate as f64 * 0.5).max(1.);
+            for q in 0..bins {
+                loga[q] = 0.5
+                    * (hp[(c * frames + f) * bins + q] + np[(c * frames + f) * bins + q])
+                        .max(1e-20)
+                        .ln();
+            }
+            for d in 0..bins {
+                let z = d as f64 / sigma;
+                gaussian[d] = (-0.5 * z * z).exp();
+            }
             for k in 0..bins {
                 let mut a = 0.;
                 let mut w = 0.;
                 for q in 0..bins {
-                    let z = (q as f64 - k as f64) / sigma;
-                    let ww = (-0.5 * z * z).exp();
-                    a += ww
-                        * ((hp[(c * frames + f) * bins + q] + np[(c * frames + f) * bins + q])
-                            .max(1e-20)
-                            .ln()
-                            * 0.5);
+                    let ww = gaussian[q.abs_diff(k)];
+                    a += ww * loga[q];
                     w += ww;
                 }
                 smooth[k] = a / w;
@@ -498,6 +588,9 @@ mod tests {
     use super::*;
     #[test]
     fn dct_shape() {
-        assert_eq!(dct(&[1.; 8], 6).len(), 6);
+        let plan = DctPlan::new(8, 6);
+        let mut output = vec![0.; 6];
+        plan.apply_into(&[1.; 8], &mut output);
+        assert_eq!(output.len(), 6);
     }
 }

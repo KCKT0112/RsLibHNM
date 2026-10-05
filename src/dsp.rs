@@ -149,6 +149,42 @@ impl Fft {
             *dst = (*z * scale).norm();
         }
     }
+    /// Analytic-signal magnitude from an already transformed real spectrum.
+    ///
+    /// This avoids the forward transform required by `analytic_envelope_into`
+    /// when a caller already has the frequency-domain band-pass result. The
+    /// supplied spectrum is interpreted as the full two-sided FFT of a real
+    /// signal, matching the Hilbert multiplier used by that method.
+    pub(crate) fn analytic_envelope_from_spectrum_into(
+        &mut self,
+        input: &[Complex64],
+        output: &mut [f64],
+    ) {
+        self.check_input(input);
+        assert_eq!(
+            output.len(),
+            self.n,
+            "analytic-envelope output length does not match plan"
+        );
+        self.buffer.copy_from_slice(input);
+        let positive = self.n.div_ceil(2);
+        for (k, z) in self.buffer.iter_mut().enumerate() {
+            let multiplier = if k == 0 || (self.n % 2 == 0 && k == self.n / 2) {
+                1.0
+            } else if k < positive {
+                2.0
+            } else {
+                0.0
+            };
+            *z *= multiplier;
+        }
+        self.inverse_plan
+            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+        let scale = 1.0 / self.n as f64;
+        for (dst, z) in output.iter_mut().zip(&self.buffer) {
+            *dst = (*z * scale).norm();
+        }
+    }
 
     /// Inverse transform of a full complex spectrum, with `1/n` normalization.
     /// The returned values are the real component of the inverse transform.

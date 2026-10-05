@@ -6,85 +6,293 @@ use num_complex::Complex64;
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
-fn fill_basis(a: &mut DMatrix<f64>, t: &[f64], f0: f64, slope: f64, count: usize) {
-    a.resize_mut(t.len(), count * 2, 0.0);
+// Row-major scratch matrices keep the hot frame path out of nalgebra's dynamic
+// allocation/multiplication machinery. `stride` allows the basis to shrink
+// from the search shape to its final harmonic count without moving storage.
+struct FlatMatrix {
+    rows: usize,
+    cols: usize,
+    stride: usize,
+    data: Vec<f64>,
+}
+
+impl FlatMatrix {
+    fn new(rows: usize, cols: usize) -> Self {
+        Self {
+            rows,
+            cols,
+            stride: cols,
+            data: vec![0.; rows * cols],
+        }
+    }
+    fn with_capacity(rows: usize, capacity: usize) -> Self {
+        Self {
+            rows,
+            cols: capacity,
+            stride: capacity,
+            data: vec![0.; rows * capacity],
+        }
+    }
+    #[inline]
+    fn at(&self, row: usize, col: usize) -> f64 {
+        self.data[row * self.stride + col]
+    }
+    #[inline]
+    fn set_cols(&mut self, cols: usize) {
+        if cols > self.stride {
+            self.stride = cols;
+            self.data.resize(self.rows * cols, 0.);
+        }
+        self.cols = cols;
+    }
+}
+
+fn fill_basis(a: &mut FlatMatrix, t: &[f64], f0: f64, slope: f64, count: usize) {
+    a.set_cols(count * 2);
     for (i, &time) in t.iter().enumerate() {
         let carrier = 2.0 * PI * (f0 * time + 0.5 * slope * time * time);
+        let row = i * a.stride;
         for k in 0..count {
             let ph = carrier * (k + 1) as f64;
-            a[(i, k)] = ph.cos();
-            a[(i, count + k)] = ph.sin();
+            a.data[row + k] = ph.cos();
+            a.data[row + count + k] = ph.sin();
         }
     }
 }
 
 struct SolveScratch {
-    gram: DMatrix<f64>,
-    rhs: DMatrix<f64>,
+    gram: Vec<f64>,
+    rhs: Vec<f64>,
+    factor: Vec<f64>,
+    solution: Vec<f64>,
 }
 
 impl SolveScratch {
     fn new(cols: usize, outputs: usize) -> Self {
         Self {
-            gram: DMatrix::zeros(cols, cols),
-            rhs: DMatrix::zeros(cols, outputs),
+            gram: vec![0.; cols * cols],
+            rhs: vec![0.; cols * outputs],
+            factor: vec![0.; cols * cols],
+            solution: vec![0.; cols * outputs],
         }
     }
 }
 
-fn solve_with_scratch(
-    a: &DMatrix<f64>,
-    y: &DMatrix<f64>,
-    weight: &[f64],
-    scratch: &mut SolveScratch,
-) -> DMatrix<f64> {
-    // Tall, narrow weighted sinusoidal design: solve the small Gram system by
-    // Cholesky and retain SVD only when rank/conditioning rejects the fit.
-    let rows = a.nrows();
-    let cols = a.ncols();
-    let outputs = y.ncols();
-    debug_assert_eq!(scratch.gram.shape(), (cols, cols));
-    debug_assert_eq!(scratch.rhs.shape(), (cols, outputs));
-    scratch.gram.fill(0.0);
-    scratch.rhs.fill(0.0);
+// Flat-buffer Cholesky for the positive-definite Gram matrix. Invalid pivots
+// take the unchanged nalgebra SVD fallback in the caller.
+fn cholesky_solve(
+    matrix: &[f64],
+    rhs: &[f64],
+    n: usize,
+    outputs: usize,
+    factor: &mut [f64],
+    out: &mut [f64],
+) -> bool {
+    factor.copy_from_slice(matrix);
+    for i in 0..n {
+        for j in 0..=i {
+            let mut value = factor[i * n + j];
+            for k in 0..j {
+                value -= factor[i * n + k] * factor[j * n + k];
+            }
+            if i == j {
+                if !value.is_finite() || value <= 0. {
+                    return false;
+                }
+                factor[i * n + j] = value.sqrt();
+            } else {
+                factor[i * n + j] = value / factor[j * n + j];
+            }
+        }
+    }
+    for i in 0..n {
+        for c in 0..outputs {
+            let mut value = rhs[i * outputs + c];
+            for k in 0..i {
+                value -= factor[i * n + k] * out[k * outputs + c];
+            }
+            out[i * outputs + c] = value / factor[i * n + i];
+        }
+    }
+    for i in (0..n).rev() {
+        for c in 0..outputs {
+            let mut value = out[i * outputs + c];
+            for k in i + 1..n {
+                value -= factor[k * n + i] * out[k * outputs + c];
+            }
+            out[i * outputs + c] = value / factor[i * n + i];
+        }
+    }
+    true
+}
+
+fn solve_with_scratch(a: &FlatMatrix, y: &FlatMatrix, weight: &[f64], scratch: &mut SolveScratch) {
+    let (rows, cols, outputs) = (a.rows, a.cols, y.cols);
+    debug_assert_eq!(y.rows, rows);
+    debug_assert_eq!(scratch.gram.len(), cols * cols);
+    debug_assert_eq!(scratch.rhs.len(), cols * outputs);
+    scratch.gram.fill(0.);
+    scratch.rhs.fill(0.);
     for i in 0..rows {
         let w2 = weight[i] * weight[i];
+        let ar = i * a.stride;
+        let yr = i * y.stride;
         for p in 0..cols {
-            let ap = a[(i, p)];
+            let ap = a.data[ar + p];
             for q in 0..=p {
-                scratch.gram[(p, q)] += w2 * ap * a[(i, q)];
+                scratch.gram[p * cols + q] += w2 * ap * a.data[ar + q];
             }
             for c in 0..outputs {
-                scratch.rhs[(p, c)] += w2 * ap * y[(i, c)];
+                scratch.rhs[p * outputs + c] += w2 * ap * y.data[yr + c];
             }
         }
     }
     for p in 0..cols {
         for q in 0..p {
-            scratch.gram[(q, p)] = scratch.gram[(p, q)];
+            scratch.gram[q * cols + p] = scratch.gram[p * cols + q];
         }
     }
-    if let Some(chol) = scratch.gram.clone().cholesky() {
-        return chol.solve(&scratch.rhs);
+    if cholesky_solve(
+        &scratch.gram,
+        &scratch.rhs,
+        cols,
+        outputs,
+        &mut scratch.factor,
+        &mut scratch.solution,
+    ) {
+        return;
     }
-    let mut aw = a.clone();
-    let mut yw = y.clone();
+    // Preserve SVD behavior for singular/indefinite Gram matrices; this path is
+    // cold for ordinary frames and retains the original 1e-8 tolerance.
+    let mut aw = DMatrix::zeros(rows, cols);
+    let mut yw = DMatrix::zeros(rows, outputs);
     for i in 0..rows {
+        let ar = i * a.stride;
+        let yr = i * y.stride;
         for q in 0..cols {
-            aw[(i, q)] *= weight[i];
+            aw[(i, q)] = a.data[ar + q] * weight[i];
         }
         for c in 0..outputs {
-            yw[(i, c)] *= weight[i];
+            yw[(i, c)] = y.data[yr + c] * weight[i];
         }
     }
-    aw.svd(true, true)
-        .solve(&yw, 1e-8)
-        .unwrap_or_else(|_| DMatrix::zeros(cols, outputs))
+    if let Ok(solution) = aw.svd(true, true).solve(&yw, 1e-8) {
+        for p in 0..cols {
+            for c in 0..outputs {
+                scratch.solution[p * outputs + c] = solution[(p, c)];
+            }
+        }
+    } else {
+        scratch.solution.fill(0.);
+    }
 }
 
-fn solve(a: &DMatrix<f64>, y: &DMatrix<f64>, weight: &[f64]) -> DMatrix<f64> {
-    let mut scratch = SolveScratch::new(a.ncols(), y.ncols());
-    solve_with_scratch(a, y, weight, &mut scratch)
+fn fit_envelope(a: &FlatMatrix, y: &FlatMatrix, w: &[f64], u: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let (channels, rows, cols) = (y.cols, a.rows, a.cols);
+    let mut gradient = vec![0.; channels];
+    let mut solve_scratch = SolveScratch::new(cols, channels);
+    solve_with_scratch(a, y, w, &mut solve_scratch);
+    let mut coeff = solve_scratch.solution.clone();
+    let (mut g0, mut g1, mut g2) = (
+        vec![0.; cols * cols],
+        vec![0.; cols * cols],
+        vec![0.; cols * cols],
+    );
+    let (mut r0, mut r1) = (vec![0.; cols * channels], vec![0.; cols * channels]);
+    for i in 0..rows {
+        let w2 = w[i] * w[i];
+        let ar = i * a.stride;
+        let yr = i * y.stride;
+        for p in 0..cols {
+            for q in 0..=p {
+                let aa = w2 * a.data[ar + p] * a.data[ar + q];
+                g0[p * cols + q] += aa;
+                g1[p * cols + q] += aa * u[i];
+                g2[p * cols + q] += aa * u[i] * u[i];
+            }
+            for c in 0..channels {
+                let ay = w2 * a.data[ar + p] * y.data[yr + c];
+                r0[p * channels + c] += ay;
+                r1[p * channels + c] += ay * u[i];
+            }
+        }
+    }
+    for p in 0..cols {
+        for q in 0..p {
+            g0[q * cols + p] = g0[p * cols + q];
+            g1[q * cols + p] = g1[p * cols + q];
+            g2[q * cols + p] = g2[p * cols + q];
+        }
+    }
+    let mut carrier = vec![0.; rows];
+    let (mut normal, mut normal_factor) = (vec![0.; cols * cols], vec![0.; cols * cols]);
+    let (mut normal_rhs, mut channel) = (vec![0.; cols], vec![0.; cols]);
+    let mut fallback_a = FlatMatrix::new(rows, cols);
+    let mut fallback_target = FlatMatrix::new(rows, 1);
+    let mut fallback_scratch = SolveScratch::new(cols, 1);
+    for c in 0..channels {
+        for k in 0..cols {
+            channel[k] = coeff[k * channels + c];
+        }
+        for _ in 0..5 {
+            for i in 0..rows {
+                let mut value = 0.;
+                for k in 0..cols {
+                    value += a.data[i * a.stride + k] * channel[k];
+                }
+                carrier[i] = value;
+            }
+            let g = bounded_minimize(
+                |g| {
+                    let mut err = 0.;
+                    for i in 0..rows {
+                        let d = w[i]
+                            * (y.data[i * y.stride + c] - carrier[i] * (1. + g * u[i]).max(0.));
+                        err += d * d;
+                    }
+                    err
+                },
+                -4.,
+                4.,
+            );
+            let env_min = u.iter().map(|x| 1. + g * x).fold(f64::INFINITY, f64::min);
+            let solved = if env_min > 0.05 {
+                for p in 0..cols {
+                    for q in 0..cols {
+                        normal[p * cols + q] =
+                            g0[p * cols + q] + 2. * g * g1[p * cols + q] + g * g * g2[p * cols + q];
+                    }
+                    normal_rhs[p] = r0[p * channels + c] + g * r1[p * channels + c];
+                }
+                cholesky_solve(
+                    &normal,
+                    &normal_rhs,
+                    cols,
+                    1,
+                    &mut normal_factor,
+                    &mut channel,
+                )
+            } else {
+                false
+            };
+            if !solved {
+                for i in 0..rows {
+                    let e = (1. + g * u[i]).max(0.);
+                    for k in 0..cols {
+                        fallback_a.data[i * fallback_a.stride + k] = a.data[i * a.stride + k] * e;
+                    }
+                    fallback_target.data[i] = y.data[i * y.stride + c];
+                }
+                solve_with_scratch(&fallback_a, &fallback_target, w, &mut fallback_scratch);
+                channel.copy_from_slice(&fallback_scratch.solution);
+            }
+            gradient[c] = g;
+        }
+        for k in 0..cols {
+            coeff[k * channels + c] = channel[k];
+        }
+    }
+    (coeff, gradient)
 }
 
 fn bounded_minimize(mut f: impl FnMut(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
@@ -109,94 +317,6 @@ fn bounded_minimize(mut f: impl FnMut(f64) -> f64, mut lo: f64, mut hi: f64) -> 
         }
     }
     if y1 < y2 { x1 } else { x2 }
-}
-
-fn fit_envelope(
-    a: &DMatrix<f64>,
-    y: &DMatrix<f64>,
-    w: &[f64],
-    u: &[f64],
-) -> (DMatrix<f64>, Vec<f64>) {
-    let channels = y.ncols();
-    let mut gradient = vec![0.; channels];
-    let mut coeff = solve(a, y, w);
-    let rows = a.nrows();
-    let cols = a.ncols();
-    let mut g0 = DMatrix::zeros(cols, cols);
-    let mut g1 = DMatrix::zeros(cols, cols);
-    let mut g2 = DMatrix::zeros(cols, cols);
-    let mut r0 = DMatrix::zeros(cols, channels);
-    let mut r1 = DMatrix::zeros(cols, channels);
-    for i in 0..rows {
-        let w2 = w[i] * w[i];
-        for p in 0..cols {
-            for q in 0..=p {
-                g0[(p, q)] += w2 * a[(i, p)] * a[(i, q)];
-                g1[(p, q)] += w2 * a[(i, p)] * a[(i, q)] * u[i];
-                g2[(p, q)] += w2 * a[(i, p)] * a[(i, q)] * u[i] * u[i];
-            }
-            for c in 0..channels {
-                r0[(p, c)] += w2 * a[(i, p)] * y[(i, c)];
-                r1[(p, c)] += w2 * a[(i, p)] * y[(i, c)] * u[i];
-            }
-        }
-    }
-    for p in 0..cols {
-        for q in 0..p {
-            g0[(q, p)] = g0[(p, q)];
-            g1[(q, p)] = g1[(p, q)];
-            g2[(q, p)] = g2[(p, q)];
-        }
-    }
-    for c in 0..channels {
-        let mut channel = coeff.column(c).into_owned();
-        let mut carrier = vec![0.; rows];
-        for _ in 0..5 {
-            for i in 0..rows {
-                let mut value = 0.;
-                for k in 0..cols {
-                    value += a[(i, k)] * channel[k];
-                }
-                carrier[i] = value;
-            }
-            let g = bounded_minimize(
-                |g| {
-                    let mut err = 0.;
-                    for i in 0..rows {
-                        let d = w[i] * (y[(i, c)] - carrier[i] * (1. + g * u[i]).max(0.));
-                        err += d * d;
-                    }
-                    err
-                },
-                -4.,
-                4.,
-            );
-            let env_min = u.iter().map(|x| 1. + g * x).fold(f64::INFINITY, f64::min);
-            let solved = if env_min > 0.05 {
-                let normal = &g0 + 2. * g * &g1 + g * g * &g2;
-                normal.cholesky().map(|ch| {
-                    ch.solve(&(r0.column(c).into_owned() + g * r1.column(c).into_owned()))
-                })
-            } else {
-                None
-            };
-            channel = solved.unwrap_or_else(|| {
-                let mut ae = a.clone();
-                let mut target = DMatrix::zeros(rows, 1);
-                for i in 0..rows {
-                    let e = (1. + g * u[i]).max(0.);
-                    for k in 0..cols {
-                        ae[(i, k)] *= e;
-                    }
-                    target[(i, 0)] = y[(i, c)];
-                }
-                solve(&ae, &target, w).column(0).into_owned()
-            });
-            gradient[c] = g;
-        }
-        coeff.set_column(c, &channel);
-    }
-    (coeff, gradient)
 }
 
 fn frame_window(
@@ -405,24 +525,27 @@ pub fn fit(
             if j > 0 && j + 1 < frames && f0_in[j - 1] > 0. && f0_in[j + 1] > 0. {
                 slope0 = (f0_in[j + 1] - f0_in[j - 1]) * sr / (2. * hop as f64);
             }
-            let target =
-                DMatrix::from_fn(b - a, 1, |i, _| audio.data[(a + i) * channels + strongest]);
+            let mut target = FlatMatrix::new(b - a, 1);
+            for i in 0..b - a {
+                target.data[i] = audio.data[(a + i) * channels + strongest];
+            }
             let fitcount = maxcount.min(12);
             let span = (length / 2) as f64 / sr;
             // Every search evaluation has identical dimensions. Fill one
             // matrix in place rather than allocating a new design matrix for
             // each of the 4x10 variable-projection evaluations.
-            let mut aa = DMatrix::zeros(b - a, fitcount * 2);
+            let mut aa = FlatMatrix::with_capacity(b - a, fitcount * 2);
+            aa.set_cols(fitcount * 2);
             let mut solve_scratch = SolveScratch::new(fitcount * 2, 1);
             let mut eval = |ff: f64, ss: f64| {
                 fill_basis(&mut aa, &t, ff, ss, fitcount);
-                let cc = solve_with_scratch(&aa, &target, &w, &mut solve_scratch);
+                solve_with_scratch(&aa, &target, &w, &mut solve_scratch);
                 let mut e = 0.;
-                for i in 0..aa.nrows() {
+                for i in 0..aa.rows {
                     let d = w[i]
-                        * (target[(i, 0)]
-                            - (0..aa.ncols())
-                                .map(|k| aa[(i, k)] * cc[(k, 0)])
+                        * (target.data[i]
+                            - (0..aa.cols)
+                                .map(|k| aa.at(i, k) * solve_scratch.solution[k])
                                 .sum::<f64>());
                     e += d * d;
                 }
@@ -430,7 +553,7 @@ pub fn fit(
             };
             let energy = (0..b - a)
                 .map(|i| {
-                    let z = w[i] * target[(i, 0)];
+                    let z = w[i] * target.data[i];
                     z * z
                 })
                 .sum::<f64>();
@@ -488,13 +611,18 @@ pub fn fit(
 
             // The normalized time is also reused by every envelope iteration.
             let u: Vec<f64> = t.iter().map(|x| x / span).collect();
-            let yy = DMatrix::from_fn(b - a, channels, |i, c| audio.data[(a + i) * channels + c]);
+            let mut yy = FlatMatrix::new(b - a, channels);
+            for i in 0..b - a {
+                for c in 0..channels {
+                    yy.data[i * channels + c] = audio.data[(a + i) * channels + c];
+                }
+            }
             let (allcoeff, allgr) = fit_envelope(&aa, &yy, &w, &u);
             for c in 0..channels {
                 result.amplitude_gradient[c] = allgr[c] / span;
                 for k in 0..count {
-                    let coeff_cos = allcoeff[(k, c)];
-                    let coeff_sin = allcoeff[(count + k, c)];
+                    let coeff_cos = allcoeff[k * channels + c];
+                    let coeff_sin = allcoeff[(count + k) * channels + c];
                     let ix = c * cap + k;
                     result.amplitude[ix] = (coeff_cos.powi(2) + coeff_sin.powi(2)).sqrt();
                     result.phase[ix] = (-coeff_sin).atan2(coeff_cos);
