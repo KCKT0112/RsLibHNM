@@ -1,3 +1,4 @@
+use std::time::Instant;
 pub mod audio;
 pub mod config;
 pub mod dsp;
@@ -139,18 +140,36 @@ impl Analysis {
     }
 }
 pub fn analyze(audio: &Audio, config: Config) -> Result<Analysis> {
+    let profiling = std::env::var_os("RSLIBHNM_PROFILE").is_some();
+    let total_start = Instant::now();
+    let mark = |name: &str, start: Instant| {
+        if profiling {
+            eprintln!(
+                "RSLibHNM stage {name}: {:.3}s",
+                start.elapsed().as_secs_f64()
+            );
+        }
+    };
+    let start = Instant::now();
     let hop = config.hop(audio.sample_rate);
     let mixture = dsp::stft(audio, config.n_fft, hop);
+    mark("mixture_stft", start);
     let frames = mixture.frames;
+    let start = Instant::now();
     let (f0, confidence) = pitch::estimate(audio, &config, hop, frames);
+    mark("f0", start);
+    let start = Instant::now();
     let (harmonics, harmonic_wave) = harmonics::fit(audio, &f0, &confidence, hop, &config)?;
+    mark("harmonics", start);
     let harmonic_audio = Audio {
         sample_rate: audio.sample_rate,
         channels: audio.channels,
         data: harmonic_wave,
         encoding: "FLOAT64".into(),
     };
+    let start = Instant::now();
     let harmonic_stft = dsp::stft(&harmonic_audio, config.n_fft, hop);
+    mark("harmonic_stft", start);
     let residual = Audio {
         sample_rate: audio.sample_rate,
         channels: audio.channels,
@@ -162,7 +181,9 @@ pub fn analyze(audio: &Audio, config: Config) -> Result<Analysis> {
             .collect(),
         encoding: "FLOAT64".into(),
     };
+    let start = Instant::now();
     let features = features::extract(&harmonic_audio, &residual, &harmonics, &config, hop)?;
+    mark("features", start);
     let metadata = Metadata {
         analysis_version: ANALYSIS_VERSION,
         sample_rate: audio.sample_rate,
@@ -183,5 +204,11 @@ pub fn analyze(audio: &Audio, config: Config) -> Result<Analysis> {
         features,
     };
     result.validate()?;
+    if profiling {
+        eprintln!(
+            "RSLibHNM total: {:.3}s",
+            total_start.elapsed().as_secs_f64()
+        );
+    }
     Ok(result)
 }
