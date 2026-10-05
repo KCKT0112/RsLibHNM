@@ -6,8 +6,8 @@ use num_complex::Complex64;
 use rayon::prelude::*;
 use std::f64::consts::PI;
 
-fn basis(t: &[f64], f0: f64, slope: f64, count: usize) -> DMatrix<f64> {
-    let mut a = DMatrix::zeros(t.len(), count * 2);
+fn fill_basis(a: &mut DMatrix<f64>, t: &[f64], f0: f64, slope: f64, count: usize) {
+    a.resize_mut(t.len(), count * 2, 0.0);
     for (i, &time) in t.iter().enumerate() {
         let carrier = 2.0 * PI * (f0 * time + 0.5 * slope * time * time);
         for k in 0..count {
@@ -16,36 +16,56 @@ fn basis(t: &[f64], f0: f64, slope: f64, count: usize) -> DMatrix<f64> {
             a[(i, count + k)] = ph.sin();
         }
     }
-    a
 }
 
-fn solve(a: &DMatrix<f64>, y: &DMatrix<f64>, weight: &[f64]) -> DMatrix<f64> {
+struct SolveScratch {
+    gram: DMatrix<f64>,
+    rhs: DMatrix<f64>,
+}
+
+impl SolveScratch {
+    fn new(cols: usize, outputs: usize) -> Self {
+        Self {
+            gram: DMatrix::zeros(cols, cols),
+            rhs: DMatrix::zeros(cols, outputs),
+        }
+    }
+}
+
+fn solve_with_scratch(
+    a: &DMatrix<f64>,
+    y: &DMatrix<f64>,
+    weight: &[f64],
+    scratch: &mut SolveScratch,
+) -> DMatrix<f64> {
     // Tall, narrow weighted sinusoidal design: solve the small Gram system by
     // Cholesky and retain SVD only when rank/conditioning rejects the fit.
     let rows = a.nrows();
     let cols = a.ncols();
     let outputs = y.ncols();
-    let mut gram = DMatrix::zeros(cols, cols);
-    let mut rhs = DMatrix::zeros(cols, outputs);
+    debug_assert_eq!(scratch.gram.shape(), (cols, cols));
+    debug_assert_eq!(scratch.rhs.shape(), (cols, outputs));
+    scratch.gram.fill(0.0);
+    scratch.rhs.fill(0.0);
     for i in 0..rows {
         let w2 = weight[i] * weight[i];
         for p in 0..cols {
             let ap = a[(i, p)];
             for q in 0..=p {
-                gram[(p, q)] += w2 * ap * a[(i, q)];
+                scratch.gram[(p, q)] += w2 * ap * a[(i, q)];
             }
             for c in 0..outputs {
-                rhs[(p, c)] += w2 * ap * y[(i, c)];
+                scratch.rhs[(p, c)] += w2 * ap * y[(i, c)];
             }
         }
     }
     for p in 0..cols {
         for q in 0..p {
-            gram[(q, p)] = gram[(p, q)];
+            scratch.gram[(q, p)] = scratch.gram[(p, q)];
         }
     }
-    if let Some(chol) = gram.clone().cholesky() {
-        return chol.solve(&rhs);
+    if let Some(chol) = scratch.gram.clone().cholesky() {
+        return chol.solve(&scratch.rhs);
     }
     let mut aw = a.clone();
     let mut yw = y.clone();
@@ -60,6 +80,11 @@ fn solve(a: &DMatrix<f64>, y: &DMatrix<f64>, weight: &[f64]) -> DMatrix<f64> {
     aw.svd(true, true)
         .solve(&yw, 1e-8)
         .unwrap_or_else(|_| DMatrix::zeros(cols, outputs))
+}
+
+fn solve(a: &DMatrix<f64>, y: &DMatrix<f64>, weight: &[f64]) -> DMatrix<f64> {
+    let mut scratch = SolveScratch::new(a.ncols(), y.ncols());
+    solve_with_scratch(a, y, weight, &mut scratch)
 }
 
 fn bounded_minimize(mut f: impl FnMut(f64) -> f64, mut lo: f64, mut hi: f64) -> f64 {
@@ -125,8 +150,15 @@ fn fit_envelope(
     }
     for c in 0..channels {
         let mut channel = coeff.column(c).into_owned();
+        let mut carrier = vec![0.; rows];
         for _ in 0..5 {
-            let carrier = a * &channel;
+            for i in 0..rows {
+                let mut value = 0.;
+                for k in 0..cols {
+                    value += a[(i, k)] * channel[k];
+                }
+                carrier[i] = value;
+            }
             let g = bounded_minimize(
                 |g| {
                     let mut err = 0.;
@@ -372,9 +404,14 @@ pub fn fit(
                 DMatrix::from_fn(b - a, 1, |i, _| audio.data[(a + i) * channels + strongest]);
             let fitcount = maxcount.min(12);
             let span = (length / 2) as f64 / sr;
-            let eval = |ff: f64, ss: f64| {
-                let aa = basis(&t, ff, ss, fitcount);
-                let cc = solve(&aa, &target, &w);
+            // Every search evaluation has identical dimensions. Fill one
+            // matrix in place rather than allocating a new design matrix for
+            // each of the 4x10 variable-projection evaluations.
+            let mut aa = DMatrix::zeros(b - a, fitcount * 2);
+            let mut solve_scratch = SolveScratch::new(fitcount * 2, 1);
+            let mut eval = |ff: f64, ss: f64| {
+                fill_basis(&mut aa, &t, ff, ss, fitcount);
+                let cc = solve_with_scratch(&aa, &target, &w, &mut solve_scratch);
                 let mut e = 0.;
                 for i in 0..aa.nrows() {
                     let d = w[i]
@@ -430,7 +467,8 @@ pub fn fit(
             let count = cap
                 .min(((sr / 2. - 1.) / (ff + ss.abs() * span)).floor().max(1.) as usize)
                 .min((valid / 4).max(1));
-            let aa = basis(&t, ff, ss, count);
+            drop(eval);
+            fill_basis(&mut aa, &t, ff, ss, count);
             result.f0 = ff;
             result.frequency[..count]
                 .iter_mut()
@@ -443,14 +481,10 @@ pub fn fit(
             result.count = count;
             result.window_length = length;
 
-            // Fit all recording channels with the final projected frequency.
+            // The normalized time is also reused by every envelope iteration.
+            let u: Vec<f64> = t.iter().map(|x| x / span).collect();
             let yy = DMatrix::from_fn(b - a, channels, |i, c| audio.data[(a + i) * channels + c]);
-            let (allcoeff, allgr) = fit_envelope(
-                &aa,
-                &yy,
-                &w,
-                &t.iter().map(|x| x / span).collect::<Vec<_>>(),
-            );
+            let (allcoeff, allgr) = fit_envelope(&aa, &yy, &w, &u);
             for c in 0..channels {
                 result.amplitude_gradient[c] = allgr[c] / span;
                 for k in 0..count {

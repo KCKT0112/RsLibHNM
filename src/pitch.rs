@@ -44,13 +44,19 @@ pub fn estimate(audio: &Audio, config: &Config, hop: usize, frames: usize) -> (V
     let forward = planner.plan_fft_forward(fft_len);
     let inverse = planner.plan_fft_inverse(fft_len);
     let mut buf = vec![Complex::new(0.0, 0.0); fft_len];
+    // These workspaces have fixed dimensions for the whole analysis. Reusing
+    // them avoids one allocation per frame without changing any arithmetic.
+    let mut y = vec![0.0; length];
+    let mut cumulative = vec![0.0; length + 1];
+    let mut nd = vec![1.0; hi.max(1)];
+    let mut minima = Vec::with_capacity(hi.saturating_sub(lo).max(1));
     let energy_floor = (max_abs * 1e-5).max(1e-12);
     let mut f0 = vec![0.0; frames];
     let mut confidence = vec![0.0; frames];
     for frame in 0..frames {
         let center = frame.saturating_mul(hop) as isize;
         let start = center - half as isize;
-        let mut y = vec![0.0; length];
+        y.fill(0.0);
         for i in 0..length {
             let n = start + i as isize;
             if n >= 0 && (n as usize) < samples {
@@ -75,11 +81,11 @@ pub fn estimate(audio: &Audio, config: &Config, hop: usize, frames: usize) -> (V
         }
         inverse.process(&mut buf);
         let scale = fft_len as f64;
-        let mut cumulative = vec![0.0; length + 1];
+        cumulative[0] = 0.0;
         for i in 0..length {
             cumulative[i + 1] = cumulative[i] + y[i] * y[i];
         }
-        let mut nd = vec![1.0; hi.max(1)];
+        nd.fill(1.0);
         let max_lag = hi.min(length.saturating_sub(1));
         for lag in 1..=max_lag {
             let overlap_e = cumulative[length - lag] + cumulative[length] - cumulative[lag];
@@ -91,7 +97,7 @@ pub fn estimate(audio: &Audio, config: &Config, hop: usize, frames: usize) -> (V
                 1.0
             };
         }
-        let mut minima = Vec::new();
+        minima.clear();
         let end = max_lag.min(hi.saturating_sub(1));
         for lag in lo.max(2)..end {
             if lag >= 2 && nd[lag - 1] <= nd[lag - 2] && nd[lag - 1] < nd[lag] {

@@ -49,6 +49,25 @@ fn render_noise(
             + std::f64::consts::PI * (h.f0[j] + h.f0[j - 1]) * hop as f64 / sr as f64
                 * (f0_scale - 1.);
     }
+    let mut bins_by_band: Vec<Vec<(usize, usize)>> = (0..4).map(|_| Vec::new()).collect();
+    let cell_span = (cells[cells.len() - 1] - cells[0]).max(1e-30);
+    for k in 0..bins {
+        let fr = k as f64 * sr as f64 / nfft as f64;
+        let pos = ((fr - cells[0]) / cell_span * (cells.len() - 1) as f64)
+            .clamp(0., (cells.len() - 2) as f64);
+        let cell = pos.floor() as usize;
+        for band in 0..4 {
+            let low = band_edges[band];
+            let high = band_edges[band + 1];
+            if high > low && fr >= low && fr < high && !(k == nfft / 2 && high < nyq) {
+                bins_by_band[band].push((k, cell));
+            }
+        }
+    }
+    let mut raw = vec![0.; h.channels * nfft];
+    let mut z = vec![Complex64::new(0., 0.); nfft];
+    let mut frame = vec![0.; nfft];
+    let window_energy = win.iter().map(|x| x * x).sum::<f64>().max(1e-30);
     for j in 0..h.frames {
         let center = j * hop;
         let half = nfft / 2;
@@ -57,11 +76,9 @@ fn render_noise(
         if b <= a {
             continue;
         }
-        let mut raw = vec![0.; h.channels * nfft];
+        raw.fill(0.);
         for band in 0..4 {
-            let low = band_edges[band];
-            let high = band_edges[band + 1];
-            if high <= low {
+            if band_edges[band + 1] <= band_edges[band] {
                 continue;
             }
             for c in 0..h.channels {
@@ -69,16 +86,8 @@ fn render_noise(
                 if !(target > 0. && target.is_finite()) {
                     continue;
                 }
-                let mut z = vec![Complex64::new(0., 0.); nfft];
-                for k in 0..bins {
-                    let fr = k as f64 * sr as f64 / nfft as f64;
-                    if fr < low || fr >= high || (k == nfft / 2 && high < nyq) {
-                        continue;
-                    }
-                    let pos = ((fr - cells[0]) / (cells[cells.len() - 1] - cells[0])
-                        * (cells.len() - 1) as f64)
-                        .clamp(0., (cells.len() - 2) as f64);
-                    let cell = pos.floor() as usize;
+                z.fill(Complex64::new(0., 0.));
+                for &(k, cell) in &bins_by_band[band] {
                     let density =
                         features.noise_psd[(c * h.frames + j) * config.npsd + cell].max(0.);
                     if k == 0 || k == nfft / 2 {
@@ -96,7 +105,7 @@ fn render_noise(
                         z[nfft - k] = z[k].conj();
                     }
                 }
-                let mut frame = fft.inverse(&z);
+                fft.inverse_into(&z, &mut frame);
                 let coeff_base = ((c * h.frames + j) * 4 + band) * (1 + 2 * order);
                 let amp = features
                     .noise_modulation
@@ -130,7 +139,7 @@ fn render_noise(
                 for i in 0..nfft {
                     energy += frame[i] * frame[i] * win[i] * win[i];
                 }
-                energy /= win.iter().map(|x| x * x).sum::<f64>().max(1e-30);
+                let energy = energy / window_energy;
                 if energy > 1e-30 {
                     let gain = (target / energy).sqrt();
                     for i in 0..nfft {

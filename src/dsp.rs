@@ -44,28 +44,110 @@ impl Fft {
         );
     }
 
-    /// Forward transform of a real signal, returning all `n` complex bins.
-    pub fn forward(&mut self, input: &[f64]) -> Vec<Complex64> {
+    /// Forward transform of a real signal, writing all `n` complex bins into `output`.
+    /// The output buffer is reused by callers that perform many transforms.
+    pub fn forward_into(&mut self, input: &[f64], output: &mut [Complex64]) {
         assert_eq!(input.len(), self.n, "FFT input length does not match plan");
+        assert_eq!(
+            output.len(),
+            self.n,
+            "FFT output length does not match plan"
+        );
         assert!(
             input.iter().all(|x| x.is_finite()),
             "FFT input must be finite"
+        );
+        for (dst, &x) in output.iter_mut().zip(input) {
+            *dst = Complex64::new(x, 0.0);
+        }
+        self.forward_plan
+            .process_with_scratch(output, &mut self.scratch);
+    }
+
+    /// Forward transform of a real signal, returning all `n` complex bins.
+    pub fn forward(&mut self, input: &[f64]) -> Vec<Complex64> {
+        let mut output = vec![Complex64::new(0.0, 0.0); self.n];
+        self.forward_into(input, &mut output);
+        output
+    }
+
+    fn inverse_into_complex(&mut self, input: &[Complex64], output: &mut [Complex64]) {
+        self.check_input(input);
+        assert_eq!(
+            output.len(),
+            self.n,
+            "FFT output length does not match plan"
+        );
+        output.copy_from_slice(input);
+        self.inverse_plan
+            .process_with_scratch(output, &mut self.scratch);
+        let scale = 1.0 / self.n as f64;
+        for z in output.iter_mut() {
+            *z *= scale;
+        }
+    }
+
+    /// Inverse transform into a reusable real output buffer.
+    pub fn inverse_into(&mut self, input: &[Complex64], output: &mut [f64]) {
+        assert_eq!(
+            output.len(),
+            self.n,
+            "FFT output length does not match plan"
+        );
+        self.check_input(input);
+        self.buffer.copy_from_slice(input);
+        self.inverse_plan
+            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+        let scale = 1.0 / self.n as f64;
+        for (dst, z) in output.iter_mut().zip(&self.buffer) {
+            *dst = (z * scale).re;
+        }
+    }
+
+    fn inverse_complex(&mut self, input: &[Complex64]) -> Vec<Complex64> {
+        let mut output = vec![Complex64::new(0.0, 0.0); self.n];
+        self.inverse_into_complex(input, &mut output);
+        output
+    }
+
+    /// Analytic-signal magnitude into a reusable output buffer.
+    pub fn analytic_envelope_into(&mut self, input: &[f64], output: &mut [f64]) {
+        assert_eq!(
+            input.len(),
+            self.n,
+            "analytic-envelope input length does not match plan"
+        );
+        assert_eq!(
+            output.len(),
+            self.n,
+            "analytic-envelope output length does not match plan"
+        );
+        assert!(
+            input.iter().all(|x| x.is_finite()),
+            "analytic-envelope input must be finite"
         );
         for (dst, &x) in self.buffer.iter_mut().zip(input) {
             *dst = Complex64::new(x, 0.0);
         }
         self.forward_plan
             .process_with_scratch(&mut self.buffer, &mut self.scratch);
-        self.buffer.clone()
-    }
-
-    fn inverse_complex(&mut self, input: &[Complex64]) -> Vec<Complex64> {
-        self.check_input(input);
-        self.buffer.copy_from_slice(input);
+        let positive = self.n.div_ceil(2);
+        for (k, z) in self.buffer.iter_mut().enumerate() {
+            let multiplier = if k == 0 || (self.n % 2 == 0 && k == self.n / 2) {
+                1.0
+            } else if k < positive {
+                2.0
+            } else {
+                0.0
+            };
+            *z *= multiplier;
+        }
         self.inverse_plan
             .process_with_scratch(&mut self.buffer, &mut self.scratch);
         let scale = 1.0 / self.n as f64;
-        self.buffer.iter().map(|z| *z * scale).collect()
+        for (dst, z) in output.iter_mut().zip(&self.buffer) {
+            *dst = (*z * scale).norm();
+        }
     }
 
     /// Inverse transform of a full complex spectrum, with `1/n` normalization.
@@ -80,31 +162,9 @@ impl Fft {
     /// Magnitude of the analytic signal obtained using the full-spectrum
     /// Hilbert-transform multiplier.
     pub fn analytic_envelope(&mut self, input: &[f64]) -> Vec<f64> {
-        assert_eq!(
-            input.len(),
-            self.n,
-            "analytic-envelope input length does not match plan"
-        );
-        assert!(
-            input.iter().all(|x| x.is_finite()),
-            "analytic-envelope input must be finite"
-        );
-        let mut spectrum = self.forward(input);
-        let positive = self.n.div_ceil(2);
-        for (k, z) in spectrum.iter_mut().enumerate() {
-            let multiplier = if k == 0 || (self.n % 2 == 0 && k == self.n / 2) {
-                1.0
-            } else if k < positive {
-                2.0
-            } else {
-                0.0
-            };
-            *z *= multiplier;
-        }
-        self.inverse_complex(&spectrum)
-            .into_iter()
-            .map(|z| z.norm())
-            .collect()
+        let mut output = vec![0.; self.n];
+        self.analytic_envelope_into(input, &mut output);
+        output
     }
 }
 
@@ -149,6 +209,7 @@ pub fn stft(audio: &Audio, n_fft: usize, hop: usize) -> Spectrum {
     let window = hann(n_fft);
     let mut frame = vec![0.0; n_fft];
     let mut out = Vec::with_capacity(output_len);
+    let mut transformed = vec![Complex64::new(0.0, 0.0); n_fft];
     for channel in 0..channels {
         for frame_idx in 0..frames {
             let start = frame_idx * hop;
@@ -161,7 +222,7 @@ pub fn stft(audio: &Audio, n_fft: usize, hop: usize) -> Spectrum {
                     0.0
                 };
             }
-            let transformed = fft.forward(&frame);
+            fft.forward_into(&frame, &mut transformed);
             out.extend_from_slice(&transformed[..bins]);
         }
     }
@@ -235,6 +296,7 @@ pub fn istft(
     let mut normalization = vec![0.0; total];
     let mut fft = Fft::new(n_fft);
     let mut full = vec![Complex64::new(0.0, 0.0); n_fft];
+    let mut frame_time = vec![0.0; n_fft];
     for channel in 0..spec.channels {
         for frame_idx in 0..spec.frames {
             let base = (channel * spec.frames + frame_idx) * bins;
@@ -248,7 +310,7 @@ pub fn istft(
                     full[mirror] = full[k].conj();
                 }
             }
-            let frame_time = fft.inverse(&full);
+            fft.inverse_into(&full, &mut frame_time);
             let start = frame_idx * hop;
             for i in 0..n_fft {
                 output[channel * total + start + i] += frame_time[i] * window[i];
