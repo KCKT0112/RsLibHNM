@@ -54,6 +54,14 @@ The Rust port is structurally complete for compact parameter analysis, H/N expor
 
 The compact full-example model is approximately 6.7 MB. Replay RMS error is `1.13e-19`; H+N versus reconstructed WAV differs by `1.49e-8` after float32 output. The Rust unit suite currently contains **15 tests**. A sample-level VUV mask removes harmonic tails in explicit unvoiced gaps, and a confidence gate reduces periodic energy in weakly periodic frames. These gates improve the targeted synthetic consonant cases but do not constitute broad recorded-vocal SDR validation; real voiced consonants and breathy vocals still require an external labeled evaluation set.
 
+The default backend is portable Rust + Rayon; it does not require Accelerate, OpenBLAS, MKL, Metal, or platform-specific native libraries. Set `RSLIBHNM_THREADS` to select a fixed Rayon worker count for reproducible runs; unset uses Rayon’s platform default:
+
+```bash
+RSLIBHNM_THREADS=8 cargo run --release --bin rsLibHNM -- separate vocal.wav -o output
+```
+
+The published timing is an Apple Silicon measurement of the portable backend, not a cross-platform guarantee. Optional platform-specific BLAS/GPU backends are not enabled in this release; future backends must pass the same H/N, feature and synthesis regression thresholds as the portable path.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).

@@ -7,6 +7,7 @@ pub mod features;
 pub mod glottal;
 pub mod harmonics;
 pub mod model;
+pub mod parallel;
 pub mod pitch;
 pub mod synthesis;
 pub mod types;
@@ -140,6 +141,7 @@ impl Analysis {
     }
 }
 pub fn analyze(audio: &Audio, config: Config) -> Result<Analysis> {
+    parallel::configure_threads();
     let profiling = std::env::var_os("RSLIBHNM_PROFILE").is_some();
     let total_start = Instant::now();
     let mark = |name: &str, start: Instant| {
