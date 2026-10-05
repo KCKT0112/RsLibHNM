@@ -652,4 +652,39 @@ mod tests {
             "harmonic layer absorbed too much gap energy: {gap_rms}"
         );
     }
+
+    #[test]
+    fn breathy_noise_stays_in_residual_against_periodic_reference() {
+        let sr = 8000_u32;
+        let n = 8000_usize;
+        let hop = 40_usize;
+        let frames = n.div_ceil(hop) + 1;
+        let mut htrue = vec![0.; n];
+        let mut data = vec![0.; n];
+        for i in 0..n {
+            let t = i as f64 / sr as f64;
+            htrue[i] = (2. * PI * 200. * t).sin() + 0.35 * (2. * PI * 400. * t).sin();
+            data[i] = htrue[i] + 0.12 * (i as f64 * 0.73).sin();
+        }
+        let f0 = vec![200.; frames];
+        let confidence = vec![1.; frames];
+        let audio = Audio {
+            sample_rate: sr,
+            channels: 1,
+            data,
+            encoding: "FLOAT64".into(),
+        };
+        let mut cfg = Config::default();
+        cfg.maxnhar = 12;
+        cfg.vocal_f0_min = 100.;
+        cfg.vocal_f0_max = 400.;
+        let (_, rendered) = fit(&audio, &f0, &confidence, hop, &cfg).unwrap();
+        let signal_energy = htrue.iter().map(|x| x * x).sum::<f64>();
+        let error = htrue
+            .iter()
+            .zip(&rendered)
+            .map(|(x, y)| (x - y) * (x - y))
+            .sum::<f64>();
+        assert!(10. * (signal_energy / error.max(1e-30)).log10() > 12.);
+    }
 }
