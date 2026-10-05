@@ -1,0 +1,5 @@
+/target/
+/short.wav
+/short_out/
+/validation/
+*.wav
