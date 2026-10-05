@@ -62,6 +62,8 @@ RSLIBHNM_THREADS=8 cargo run --release --bin rsLibHNM -- separate vocal.wav -o o
 
 The published timing is an Apple Silicon measurement of the portable backend, not a cross-platform guarantee. Optional platform-specific BLAS/GPU backends are not enabled in this release; future backends must pass the same H/N, feature and synthesis regression thresholds as the portable path.
 
+CI runs the portable backend on Linux x86_64, macOS arm64, and Windows x86_64 with formatting, compile, and unit-test checks. Performance numbers are reported per runner; they are not merged into a single cross-platform claim.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
